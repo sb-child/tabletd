@@ -9,12 +9,20 @@ license = "MPL-2.0"
 anyhow = "1.0.96"
 bluer = { version = "0.17.3", features = ["full"] }
 clap = { version = "4.5.31", features = ["derive"] }
+drm = "0.14.1"
 evdev-rs = { version = "0.6.1", features = ["serde"] }
+gbm = "0.18.0"
 num_enum = "0.7.3"
 rusb = "0.9.4"
 serde = { version = "1.0.218", features = ["derive"] }
+tempfile = "3.19.1"
 tokio = { version = "1.43.0", features = ["full"] }
 toml = "0.8.20"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
+wayland-client = "0.31.8"
+wayland-egl = "0.32.5"
+wayland-protocols = "0.32.6"
+wayland-protocols-wlr = { version = "0.3.6", features = ["client"] }
+wayland-server = "0.31.7"
 

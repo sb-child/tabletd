@@ -1,9 +1,14 @@
-use num_enum::FromPrimitive;
-
 #[derive(Debug, Clone, Copy)]
 pub struct Tilt {
     pub x: i16,
     pub y: i16,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PenLocation {
+    Leaved,
+    Floating,
+    Pressed,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -25,6 +30,7 @@ pub struct PenState {
     pub pressure: u32,
     pub tilt: Tilt,
     pub tool: ToolType,
+    pub location: PenLocation,
 }
 
 #[derive(Debug, Clone)]
@@ -33,10 +39,8 @@ pub struct AuxButtonEvent {
     pub pressed: bool,
 }
 
-#[derive(Debug, Clone, Copy, FromPrimitive)]
-#[repr(u8)]
+#[derive(Debug, Clone)]
 pub enum WheelDirection {
-    #[default]
     Clockwise,
     CounterClockwise,
 }
