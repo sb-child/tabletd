@@ -54,7 +54,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         event: wl_registry::Event,
         _: &(),
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        qhandle: &QueueHandle<Self>,
     ) {
         if let wl_registry::Event::Global {
             name,
@@ -66,8 +66,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             match &interface[..] {
                 "wl_compositor" => {
                     println!("wl_compositor");
-                    let compositor =
-                        registry.bind::<wl_compositor::WlCompositor, _, _>(name, version, qh, ());
+                    let compositor = registry.bind::<wl_compositor::WlCompositor, _, _>(
+                        name,
+                        version,
+                        qhandle,
+                        (),
+                    );
 
                     // let layer_shell = registry.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(
                     //     name,
@@ -78,12 +82,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
 
                     // let output = registry.bind::<wl_output::WlOutput, _, _>(name, version, qh, ());
 
-                    let surface = compositor.create_surface(qh, ());
+                    let surface = compositor.create_surface(qhandle, ());
                     // let compositor =
                     //     registry.bind::<wl_compositor::WlCompositor, _, _>(name, 1, qh, ());
                     // let surface = compositor.create_surface(qh, ());
 
-                    let input_region = compositor.create_region(qh, ());
+                    let input_region = compositor.create_region(qhandle, ());
                     surface.set_input_region(Some(&input_region));
 
                     // let layer_surface =
@@ -100,11 +104,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 }
                 "wl_shm" => {
                     println!("wl_shm");
-                    let shm = registry.bind::<wl_shm::WlShm, _, _>(name, version, qh, ());
+                    let shm = registry.bind::<wl_shm::WlShm, _, _>(name, version, qhandle, ());
                     let (init_w, init_h) = (320, 240);
                     let mut file = tempfile::tempfile().unwrap();
                     draw(&mut file, (init_w, init_h));
-                    let pool = shm.create_pool(file.as_fd(), (init_w * init_h * 4) as i32, qh, ());
+                    let pool =
+                        shm.create_pool(file.as_fd(), (init_w * init_h * 4) as i32, qhandle, ());
 
                     let buffer = pool.create_buffer(
                         0,
@@ -112,7 +117,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         init_h as i32,
                         (init_w * 4) as i32,
                         wl_shm::Format::Argb8888,
-                        qh,
+                        qhandle,
                         (),
                     );
 
@@ -132,7 +137,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 }
                 "wl_output" => {
                     println!("wl_output");
-                    let output = registry.bind::<wl_output::WlOutput, _, _>(name, version, qh, ());
+                    let output =
+                        registry.bind::<wl_output::WlOutput, _, _>(name, version, qhandle, ());
                     state.output = Some(output)
                 }
                 "zwlr_layer_shell_v1" => {
@@ -140,7 +146,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     let layer_shell = registry.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(
                         name,
                         version,
-                        qh,
+                        qhandle,
                         (),
                     );
 
@@ -150,7 +156,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                             state.output.as_ref(),
                             zwlr_layer_shell_v1::Layer::Overlay,
                             "tabletd overlay (wayland backend)".to_string(),
-                            qh,
+                            qhandle,
                             (),
                         );
                         layer_surface.set_size(320, 240);
@@ -189,7 +195,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
 impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
     fn event(
         state: &mut Self,
-        proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        layer_surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         event: <zwlr_layer_surface_v1::ZwlrLayerSurfaceV1 as wayland_client::Proxy>::Event,
         _: &(),
         conn: &Connection,
@@ -201,12 +207,47 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
                 width,
                 height,
             } => {
-                proxy.ack_configure(serial);
+                layer_surface.ack_configure(serial);
                 if let Some(surface) = &state.base_surface {
                     surface.commit();
                 }
             }
             zwlr_layer_surface_v1::Event::Closed => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for State {
+    fn event(
+        state: &mut Self,
+        output: &wl_output::WlOutput,
+        event: <wl_output::WlOutput as wayland_client::Proxy>::Event,
+        _: &(),
+        conn: &Connection,
+        qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_output::Event::Geometry {
+                x,
+                y,
+                physical_width,
+                physical_height,
+                subpixel,
+                make,
+                model,
+                transform,
+            } => {}
+            wl_output::Event::Mode {
+                flags,
+                width,
+                height,
+                refresh,
+            } => {}
+            wl_output::Event::Done => {}
+            wl_output::Event::Scale { factor } => {}
+            wl_output::Event::Name { name } => {}
+            wl_output::Event::Description { description } => {}
             _ => {}
         }
     }
@@ -220,7 +261,7 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore wl_region::WlRegion);
 delegate_noop!(State: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 // delegate_noop!(State: ignore zwlr_layer_surface_v1::ZwlrLayerSurfaceV1);
-delegate_noop!(State: ignore wl_output::WlOutput);
+// delegate_noop!(State: ignore wl_output::WlOutput);
 
 fn draw(tmp: &mut File, (buf_x, buf_y): (u32, u32)) {
     use std::{cmp::min, io::Write};

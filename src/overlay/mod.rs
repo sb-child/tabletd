@@ -1,4 +1,6 @@
 pub mod backend_drm;
+/// # Wayland overlay backend
+///
 /// `wayland` 后端, 基于 [`wlr layer shell`](https://wayland.app/protocols/wlr-layer-shell-unstable-v1) 实现
 ///
 /// ## 兼容性
