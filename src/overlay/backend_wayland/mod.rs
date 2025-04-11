@@ -20,13 +20,12 @@ pub fn test_overlay() {
 
     let mut state = State {
         running: true,
-        configured: false,
         base_surface: None,
         buffer: None,
         input_region: None,
-        zwlr_layer_shell: None,
         output: None,
         layer_surface: None,
+        _zwlr_layer_shell: None,
     };
 
     while state.running {
