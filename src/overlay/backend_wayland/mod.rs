@@ -1,10 +1,10 @@
 use std::{fs::File, os::fd::AsFd};
 
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
+    Connection, Dispatch, QueueHandle, delegate_noop,
     protocol::{
-        wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_region, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_buffer, wl_compositor, wl_output, wl_region, wl_registry, wl_shm, wl_shm_pool,
+        wl_surface,
     },
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
@@ -39,12 +39,9 @@ struct State {
     base_surface: Option<wl_surface::WlSurface>,
     buffer: Option<wl_buffer::WlBuffer>,
     input_region: Option<wl_region::WlRegion>,
-    zwlr_layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    _zwlr_layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     output: Option<wl_output::WlOutput>,
     layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
-    // wm_base: Option<xdg_wm_base::XdgWmBase>,
-    // xdg_surface: Option<(xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel)>,
-    configured: bool,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -62,7 +59,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             version,
         } = event
         {
-            // println!("{}", interface);
             match &interface[..] {
                 "wl_compositor" => {
                     println!("wl_compositor");
@@ -73,34 +69,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         (),
                     );
 
-                    // let layer_shell = registry.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(
-                    //     name,
-                    //     version,
-                    //     qh,
-                    //     (),
-                    // );
-
-                    // let output = registry.bind::<wl_output::WlOutput, _, _>(name, version, qh, ());
-
                     let surface = compositor.create_surface(qhandle, ());
-                    // let compositor =
-                    //     registry.bind::<wl_compositor::WlCompositor, _, _>(name, 1, qh, ());
-                    // let surface = compositor.create_surface(qh, ());
 
                     let input_region = compositor.create_region(qhandle, ());
                     surface.set_input_region(Some(&input_region));
 
-                    // let layer_surface =
-                    //     layer_shell.get_layer_surface(&surface, output, layer, namespace, qh, ());
-
                     state.base_surface = Some(surface);
                     state.input_region = Some(input_region);
-
-                    // zwlr_layer_shell_v1::ZwlrLayerShellV1
-
-                    // if state.wm_base.is_some() && state.xdg_surface.is_none() {
-                    //     state.init_xdg_surface(qh);
-                    // }
                 }
                 "wl_shm" => {
                     println!("wl_shm");
@@ -128,12 +103,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     } else {
                         println!("state.base_surface is None")
                     }
-
-                    // if state.configured {
-                    //     let surface = state.base_surface.as_ref().unwrap();
-                    //     surface.attach(Some(&buffer), 0, 0);
-                    //     surface.commit();
-                    // }
                 }
                 "wl_output" => {
                     println!("wl_output");
@@ -176,15 +145,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 }
                 "wl_seat" => {
                     println!("wl_seat");
-                    // registry.bind::<wl_seat::WlSeat, _, _>(name, 1, qh, ());
-                }
-                "xdg_wm_base" => {
-                    // let wm_base = registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ());
-                    // state.wm_base = Some(wm_base);
-
-                    // if state.base_surface.is_some() && state.xdg_surface.is_none() {
-                    //     state.init_xdg_surface(qh);
-                    // }
                 }
                 _ => {}
             }
@@ -198,14 +158,15 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
         layer_surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         event: <zwlr_layer_surface_v1::ZwlrLayerSurfaceV1 as wayland_client::Proxy>::Event,
         _: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
+        // https://wayland.app/protocols/wlr-layer-shell-unstable-v1#zwlr_layer_surface_v1
         match event {
             zwlr_layer_surface_v1::Event::Configure {
                 serial,
-                width,
-                height,
+                width: _,
+                height: _,
             } => {
                 layer_surface.ack_configure(serial);
                 if let Some(surface) = &state.base_surface {
@@ -227,6 +188,8 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
         conn: &Connection,
         qhandle: &QueueHandle<Self>,
     ) {
+        // TODO: 读取显示器信息
+        // https://wayland.app/protocols/wayland#wl_output
         match event {
             wl_output::Event::Geometry {
                 x,

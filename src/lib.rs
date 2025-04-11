@@ -1,4 +1,4 @@
-/// 传输数位板事件到外部(如 `wayland evdev`)
+/// 数位板事件服务端(供外部程序使用)
 pub mod dispatch;
 /// 数位板驱动
 pub mod driver;
