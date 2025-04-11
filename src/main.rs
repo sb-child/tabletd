@@ -1,7 +1,7 @@
-use tabletd::overlay;
+use tabletd::screen_overlay;
 
 fn main() {
     println!("Hello, world!");
 
-    overlay::backend_wayland::test_overlay();
+    screen_overlay::backend_wayland::test_overlay();
 }
