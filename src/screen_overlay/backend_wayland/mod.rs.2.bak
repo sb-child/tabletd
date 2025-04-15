@@ -1,4 +1,3 @@
-pub mod surface_info;
 use std::{
     collections::HashMap,
     fs::File,
@@ -7,6 +6,7 @@ use std::{
 };
 
 use tokio::sync::{mpsc, oneshot};
+use tracing_subscriber::field::display;
 use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
     protocol::{
@@ -15,10 +15,6 @@ use wayland_client::{
     },
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
-
-mod surface_state;
-
-use surface_state::SurfaceState;
 
 #[derive(Debug)]
 pub struct DisplayInfo {
@@ -51,6 +47,16 @@ impl Display {
     }
 }
 
+/// 存储WaylandOverlay需要的表面信息
+#[derive(Clone)]
+pub struct SurfaceInfo {
+    pub id: u32,
+    pub width: i32,
+    pub height: i32,
+    pub name: Option<String>,
+    pub scale_factor: i32,
+}
+
 /// WaylandOverlay层支持的命令
 enum OverlayCommand {
     GetNextDisplay(oneshot::Sender<Option<SurfaceInfo>>),
@@ -65,6 +71,25 @@ pub struct WaylandOverlay {
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// 内部状态对象，用于在异步任务内维护
+struct WaylandState {
+    surfaces: HashMap<u32, SurfaceInfo>,
+    current_surface_id: Option<u32>,
+    raw_surfaces: HashMap<u32, RawSurfaceInfo>,
+    available_surfaces: Vec<u32>,     // 可用的显示器ID列表
+    used_surfaces: HashMap<u32, u32>, // 显示器ID到引用计数的映射
+}
+
+/// Surface内部信息，包含Wayland对象
+#[derive(Clone)]
+struct RawSurfaceInfo {
+    id: u32,
+    surface: wl_surface::WlSurface,
+    layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    input_region: wl_region::WlRegion,
+    buffer: Option<wl_buffer::WlBuffer>,
+}
+
 impl WaylandOverlay {
     /// 创建一个新的WaylandOverlay实例
     pub fn new() -> Self {
@@ -72,7 +97,7 @@ impl WaylandOverlay {
 
         // 启动后台任务来处理Wayland事件
         let task_handle = tokio::spawn(async move {
-            let state = Arc::new(Mutex::new(SurfaceState::new()));
+            let state = Arc::new(Mutex::new(WaylandState::new()));
 
             // 创建一个tokio通道用于启动创建displays的任务
             let (create_tx, mut create_rx) = mpsc::channel::<()>(1);
@@ -234,7 +259,7 @@ impl WaylandOverlay {
                             }
 
                             // 给其他任务机会处理
-                            // std::thread::sleep(std::time::Duration::from_millis(10));
+                            std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                     }
                 }
@@ -648,7 +673,7 @@ pub async fn test_overlay() -> Result<(), Box<dyn std::error::Error>> {
     let overlay = WaylandOverlay::new();
 
     // 等待一段时间，让overlay有时间设置
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     // 尝试获取所有显示器
     // if let Some(display) = overlay.current_display().await {
@@ -714,6 +739,31 @@ impl WaylandEventState {
 
         println!("至少一个显示器已准备好");
         return true;
+    }
+}
+
+impl WaylandState {
+    /// 初始化状态
+    fn new() -> Self {
+        Self {
+            surfaces: HashMap::new(),
+            current_surface_id: None,
+            raw_surfaces: HashMap::new(),
+            available_surfaces: Vec::new(),
+            used_surfaces: HashMap::new(),
+        }
+    }
+
+    /// 添加新的surface
+    fn add_surface(&mut self, id: u32, surface_info: SurfaceInfo, raw_info: RawSurfaceInfo) {
+        self.surfaces.insert(id, surface_info);
+        self.raw_surfaces.insert(id, raw_info);
+        self.available_surfaces.push(id);
+
+        // 如果这是第一个surface，设置为当前surface
+        // if self.current_surface_id.is_none() {
+        //     self.current_surface_id = Some(id);
+        // }
     }
 }
 

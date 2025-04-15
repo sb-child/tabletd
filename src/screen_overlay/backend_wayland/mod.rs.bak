@@ -1,0 +1,656 @@
+use std::{collections::HashMap, fs::File, os::fd::AsFd};
+
+use wayland_client::{
+    Connection, Dispatch, QueueHandle, delegate_noop,
+    protocol::{
+        wl_buffer, wl_compositor, wl_output, wl_region, wl_registry, wl_shm, wl_shm_pool,
+        wl_surface,
+    },
+};
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+
+/// WaylandOverlay 代表在Wayland下实现的屏幕叠加层
+/// 用于显示光标和HUD界面
+pub struct WaylandOverlay {
+    // 可以添加公共方法和属性
+    connection: Option<Connection>,
+    event_queue: Option<wayland_client::EventQueue<MultiDisplayState>>,
+}
+
+impl WaylandOverlay {
+    /// 创建一个新的WaylandOverlay实例
+    pub fn new() -> Self {
+        Self {
+            connection: None,
+            event_queue: None,
+        }
+    }
+
+    /// 为每个显示器创建一个全屏overlay
+    pub fn create_for_displays(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // 连接到Wayland服务器
+        let conn = Connection::connect_to_env()?;
+
+        // 创建事件队列
+        let mut event_queue = conn.new_event_queue();
+        let qhandle = event_queue.handle();
+
+        // 获取注册表
+        let display = conn.display();
+        display.get_registry(&qhandle, ());
+
+        // 初始化状态
+        let mut state = MultiDisplayState {
+            running: true,
+            registry_ready: false,
+            compositor: None,
+            shm: None,
+            layer_shell: None,
+            outputs: HashMap::new(),
+            surfaces: HashMap::new(),
+        };
+
+        // 第一轮事件循环，获取所有必要的Wayland接口和显示器信息
+        println!("等待Wayland接口和显示器信息...");
+        while !state.registry_ready || state.outputs.is_empty() {
+            event_queue.blocking_dispatch(&mut state)?;
+        }
+
+        // 检查是否获取到所有必要的接口
+        if state.compositor.is_none() || state.shm.is_none() || state.layer_shell.is_none() {
+            return Err("未能获取必要的Wayland接口".into());
+        }
+
+        // 创建每个显示器的overlay
+        println!("为{}个显示器创建overlay...", state.outputs.len());
+        for (output_id, output_info) in &state.outputs {
+            println!("为显示器 {} ({}) 创建overlay", output_id, output_info.name);
+
+            // 创建surface
+            let surface = state
+                .compositor
+                .as_ref()
+                .unwrap()
+                .create_surface(&qhandle, ());
+
+            // 创建输入区域（使overlay不接收输入事件）
+            let input_region = state
+                .compositor
+                .as_ref()
+                .unwrap()
+                .create_region(&qhandle, ());
+            surface.set_input_region(Some(&input_region));
+
+            // 创建layer_surface
+            let layer_surface = state.layer_shell.as_ref().unwrap().get_layer_surface(
+                &surface,
+                Some(&output_info.output),
+                zwlr_layer_shell_v1::Layer::Overlay,
+                format!("tabletd overlay for {}", output_info.name),
+                &qhandle,
+                (),
+            );
+
+            // 配置layer_surface属性
+            let width = output_info.width.unwrap_or(800);
+            let height = output_info.height.unwrap_or(600);
+
+            layer_surface.set_size(width as u32, height as u32);
+            layer_surface.set_anchor(
+                zwlr_layer_surface_v1::Anchor::Top
+                    | zwlr_layer_surface_v1::Anchor::Left
+                    | zwlr_layer_surface_v1::Anchor::Right
+                    | zwlr_layer_surface_v1::Anchor::Bottom,
+            );
+            layer_surface.set_exclusive_zone(-1); // 不排除其他窗口
+            layer_surface.set_margin(0, 0, 0, 0);
+            layer_surface
+                .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+
+            // 创建并绘制缓冲区
+            let mut file = tempfile::tempfile()?;
+            draw(&mut file, (width as u32, height as u32));
+
+            let pool = state.shm.as_ref().unwrap().create_pool(
+                file.as_fd(),
+                (width * height * 4) as i32,
+                &qhandle,
+                (),
+            );
+
+            let buffer = pool.create_buffer(
+                0,
+                width as i32,
+                height as i32,
+                (width * 4) as i32,
+                wl_shm::Format::Argb8888,
+                &qhandle,
+                (),
+            );
+
+            // 附加缓冲区并提交surface
+            surface.attach(Some(&buffer), 0, 0);
+            surface.commit();
+
+            // 保存surface信息
+            state.surfaces.insert(
+                *output_id,
+                SurfaceInfo {
+                    surface,
+                    input_region,
+                    layer_surface,
+                    buffer: Some(buffer),
+                },
+            );
+        }
+
+        // 存储连接和事件队列
+        self.connection = Some(conn);
+        self.event_queue = Some(event_queue);
+
+        // 进入主事件循环
+        println!("进入事件循环...");
+        self.run_event_loop()
+    }
+
+    /// 运行Wayland事件循环
+    fn run_event_loop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(event_queue) = &mut self.event_queue {
+            let mut state = MultiDisplayState {
+                running: true,
+                registry_ready: true,
+                compositor: None,
+                shm: None,
+                layer_shell: None,
+                outputs: HashMap::new(),
+                surfaces: HashMap::new(),
+            };
+            while state.running {
+                event_queue.blocking_dispatch(&mut state)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 显示器信息
+struct OutputInfo {
+    output: wl_output::WlOutput,
+    name: String,
+    description: Option<String>,
+    width: Option<i32>,
+    height: Option<i32>,
+    scale_factor: i32,
+    // 可以添加更多显示器属性
+}
+
+/// Surface信息
+struct SurfaceInfo {
+    surface: wl_surface::WlSurface,
+    input_region: wl_region::WlRegion,
+    layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    buffer: Option<wl_buffer::WlBuffer>,
+}
+
+/// 多显示器状态
+struct MultiDisplayState {
+    running: bool,
+    registry_ready: bool,
+    compositor: Option<wl_compositor::WlCompositor>,
+    shm: Option<wl_shm::WlShm>,
+    layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    outputs: HashMap<u32, OutputInfo>,
+    surfaces: HashMap<u32, SurfaceInfo>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for MultiDisplayState {
+    fn event(
+        state: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        qhandle: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            match &interface[..] {
+                "wl_compositor" => {
+                    println!("找到wl_compositor");
+                    let compositor = registry.bind::<wl_compositor::WlCompositor, _, _>(
+                        name,
+                        version,
+                        qhandle,
+                        (),
+                    );
+                    state.compositor = Some(compositor);
+                }
+                "wl_shm" => {
+                    println!("找到wl_shm");
+                    let shm = registry.bind::<wl_shm::WlShm, _, _>(name, version, qhandle, ());
+                    state.shm = Some(shm);
+                }
+                "wl_output" => {
+                    println!("找到wl_output: {}", name);
+                    let output =
+                        registry.bind::<wl_output::WlOutput, _, _>(name, version, qhandle, name);
+
+                    // 初始化输出信息
+                    state.outputs.insert(
+                        name,
+                        OutputInfo {
+                            output,
+                            name: format!("output-{}", name),
+                            description: None,
+                            width: None,
+                            height: None,
+                            scale_factor: 1,
+                        },
+                    );
+                }
+                "zwlr_layer_shell_v1" => {
+                    println!("找到zwlr_layer_shell_v1");
+                    let layer_shell = registry.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(
+                        name,
+                        version,
+                        qhandle,
+                        (),
+                    );
+                    state.layer_shell = Some(layer_shell);
+                }
+                _ => {}
+            }
+        } else if let wl_registry::Event::GlobalRemove { name } = event {
+            // 处理显示器移除事件
+            if state.outputs.contains_key(&name) {
+                println!("显示器已移除: {}", name);
+                state.outputs.remove(&name);
+                state.surfaces.remove(&name);
+            }
+        }
+
+        // 检查是否所有必要的接口都已准备好
+        if state.compositor.is_some() && state.shm.is_some() && state.layer_shell.is_some() {
+            state.registry_ready = true;
+        }
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for MultiDisplayState {
+    fn event(
+        state: &mut Self,
+        output: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // 获取并存储显示器信息
+        for (_id, info) in &mut state.outputs {
+            match event {
+                wl_output::Event::Geometry {
+                    x: _,
+                    y: _,
+                    physical_width: _,
+                    physical_height: _,
+                    subpixel: _,
+                    make: _,
+                    model: _,
+                    transform: _,
+                } => {
+                    // 可以处理和存储物理尺寸等信息
+                }
+                wl_output::Event::Mode {
+                    flags: _,
+                    width,
+                    height,
+                    refresh: _,
+                } => {
+                    // 存储显示器分辨率
+                    info.width = Some(width);
+                    info.height = Some(height);
+                    println!("显示器分辨率: {}x{}", width, height);
+                }
+                wl_output::Event::Scale { factor } => {
+                    // 存储缩放因子
+                    info.scale_factor = factor;
+                    println!("显示器缩放因子: {}", factor);
+                }
+                wl_output::Event::Name { name } => {
+                    // 存储显示器名称
+                    info.name = name.clone();
+                    println!("显示器名称: {}", info.name);
+                }
+                wl_output::Event::Description { description } => {
+                    // 存储显示器描述
+                    info.description = Some(description);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for MultiDisplayState {
+    fn event(
+        state: &mut Self,
+        layer_surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                // 确认配置
+                layer_surface.ack_configure(serial);
+
+                // 注意：在没有output_id的情况下，我们无法精确定位surface
+                // 打印配置信息
+                println!("layer_surface配置: {}x{}", width, height);
+
+                // 此处需要重新设计如何管理多个surface和关联它们
+            }
+            zwlr_layer_surface_v1::Event::Closed => {
+                println!("layer_surface已关闭");
+                // 如果所有surface都已关闭，退出事件循环
+                if state.surfaces.is_empty() {
+                    println!("所有layer_surface已关闭，退出事件循环");
+                    state.running = false;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// 为各种Wayland接口实现空分发
+delegate_noop!(MultiDisplayState: ignore wl_compositor::WlCompositor);
+delegate_noop!(MultiDisplayState: ignore wl_surface::WlSurface);
+delegate_noop!(MultiDisplayState: ignore wl_shm::WlShm);
+delegate_noop!(MultiDisplayState: ignore wl_shm_pool::WlShmPool);
+delegate_noop!(MultiDisplayState: ignore wl_buffer::WlBuffer);
+delegate_noop!(MultiDisplayState: ignore wl_region::WlRegion);
+delegate_noop!(MultiDisplayState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+
+/// 测试Wayland overlay的实现
+/// 创建一个简单的彩色矩形，显示在屏幕左上角
+pub fn test_overlay() {
+    let conn = Connection::connect_to_env().unwrap();
+
+    let mut event_queue = conn.new_event_queue();
+    let qhandle = event_queue.handle();
+
+    let display = conn.display();
+    display.get_registry(&qhandle, ());
+
+    let mut state = State {
+        running: true,
+        base_surface: None,
+        buffer: None,
+        input_region: None,
+        output: None,
+        layer_surface: None,
+        _zwlr_layer_shell: None,
+    };
+
+    while state.running {
+        event_queue.blocking_dispatch(&mut state).unwrap();
+    }
+}
+
+/// 维护Wayland连接状态的结构体
+struct State {
+    running: bool,
+    base_surface: Option<wl_surface::WlSurface>,
+    buffer: Option<wl_buffer::WlBuffer>,
+    input_region: Option<wl_region::WlRegion>,
+    _zwlr_layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    output: Option<wl_output::WlOutput>,
+    layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for State {
+    fn event(
+        state: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        qhandle: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            match &interface[..] {
+                "wl_compositor" => {
+                    println!("wl_compositor");
+                    let compositor = registry.bind::<wl_compositor::WlCompositor, _, _>(
+                        name,
+                        version,
+                        qhandle,
+                        (),
+                    );
+
+                    // 创建基础surface和输入区域
+                    let surface = compositor.create_surface(qhandle, ());
+                    let input_region = compositor.create_region(qhandle, ());
+
+                    // 设置输入区域（用于控制鼠标输入捕获）
+                    surface.set_input_region(Some(&input_region));
+
+                    state.base_surface = Some(surface);
+                    state.input_region = Some(input_region);
+                }
+                "wl_shm" => {
+                    println!("wl_shm");
+                    let shm = registry.bind::<wl_shm::WlShm, _, _>(name, version, qhandle, ());
+
+                    // 创建临时缓冲区和绘制内容
+                    let (init_w, init_h) = (320, 240);
+                    let mut file = tempfile::tempfile().unwrap();
+                    draw(&mut file, (init_w, init_h));
+                    let pool =
+                        shm.create_pool(file.as_fd(), (init_w * init_h * 4) as i32, qhandle, ());
+
+                    // 创建缓冲区并附加到surface
+                    let buffer = pool.create_buffer(
+                        0,
+                        init_w as i32,
+                        init_h as i32,
+                        (init_w * 4) as i32,
+                        wl_shm::Format::Argb8888,
+                        qhandle,
+                        (),
+                    );
+
+                    state.buffer = Some(buffer.clone());
+                    if let Some(surface) = &state.base_surface {
+                        surface.attach(Some(&buffer), 0, 0);
+                        surface.commit();
+                    } else {
+                        println!("state.base_surface is None")
+                    }
+                }
+                "wl_output" => {
+                    println!("wl_output");
+                    // 获取输出设备（显示器）信息
+                    let output =
+                        registry.bind::<wl_output::WlOutput, _, _>(name, version, qhandle, ());
+                    state.output = Some(output)
+                }
+                "zwlr_layer_shell_v1" => {
+                    println!("zwlr_layer_shell_v1");
+                    // 获取层面板协议接口
+                    let layer_shell = registry.bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(
+                        name,
+                        version,
+                        qhandle,
+                        (),
+                    );
+
+                    if let Some(surface) = &state.base_surface {
+                        // 创建层面板surface并设置属性
+                        let layer_surface = layer_shell.get_layer_surface(
+                            &surface,
+                            state.output.as_ref(),
+                            zwlr_layer_shell_v1::Layer::Overlay, // 使用Overlay层
+                            "tabletd overlay (wayland backend)".to_string(),
+                            qhandle,
+                            (),
+                        );
+
+                        // 配置层面板属性
+                        layer_surface.set_size(320, 240);
+                        layer_surface.set_anchor(
+                            zwlr_layer_surface_v1::Anchor::Top
+                                | zwlr_layer_surface_v1::Anchor::Left,
+                        );
+                        layer_surface.set_exclusive_zone(-1); // 不排除其他窗口
+                        layer_surface.set_margin(0, 0, 0, 0);
+                        layer_surface.set_keyboard_interactivity(
+                            zwlr_layer_surface_v1::KeyboardInteractivity::None,
+                        );
+                        state.layer_surface = Some(layer_surface)
+                    } else {
+                        println!("state.base_surface is None")
+                    }
+                }
+                "wl_seat" => {
+                    println!("wl_seat");
+                    // 未来可以用于处理输入事件
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        layer_surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: <zwlr_layer_surface_v1::ZwlrLayerSurfaceV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // 处理层面板事件
+        // https://wayland.app/protocols/wlr-layer-shell-unstable-v1#zwlr_layer_surface_v1
+        match event {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width: _,
+                height: _,
+            } => {
+                // 确认配置并提交表面
+                layer_surface.ack_configure(serial);
+                if let Some(surface) = &state.base_surface {
+                    surface.commit();
+                }
+            }
+            zwlr_layer_surface_v1::Event::Closed => {
+                // 层面板被关闭时的处理
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _output: &wl_output::WlOutput,
+        event: <wl_output::WlOutput as wayland_client::Proxy>::Event,
+        _: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // 处理显示器信息事件
+        // https://wayland.app/protocols/wayland#wl_output
+        match event {
+            wl_output::Event::Geometry {
+                x: _,
+                y: _,
+                physical_width: _,
+                physical_height: _,
+                subpixel: _,
+                make: _,
+                model: _,
+                transform: _,
+            } => {
+                // 获取显示器几何信息
+                // TODO: 存储显示器信息用于多显示器支持
+            }
+            wl_output::Event::Mode {
+                flags: _,
+                width: _,
+                height: _,
+                refresh: _,
+            } => {
+                // 获取显示器模式信息
+                // TODO: 记录分辨率用于overlay尺寸适配
+            }
+            wl_output::Event::Done => {
+                // 显示器信息更新完成
+            }
+            wl_output::Event::Scale { factor: _ } => {
+                // 显示器缩放因子
+                // TODO: 支持不同缩放比例
+            }
+            wl_output::Event::Name { name: _ } => {
+                // 显示器名称
+                // TODO: 记录显示器名称用于配置
+            }
+            wl_output::Event::Description { description: _ } => {
+                // 显示器描述
+            }
+            _ => {}
+        }
+    }
+}
+
+// 为不需要处理事件的接口实现空分发
+delegate_noop!(State: ignore wl_compositor::WlCompositor);
+delegate_noop!(State: ignore wl_surface::WlSurface);
+delegate_noop!(State: ignore wl_shm::WlShm);
+delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
+delegate_noop!(State: ignore wl_buffer::WlBuffer);
+delegate_noop!(State: ignore wl_region::WlRegion);
+delegate_noop!(State: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+
+/// 在临时文件中绘制示例图像
+fn draw(tmp: &mut File, (buf_x, buf_y): (u32, u32)) {
+    use std::{cmp::min, io::Write};
+    let mut buf = std::io::BufWriter::new(tmp);
+    for y in 0..buf_y {
+        for x in 0..buf_x {
+            let a = 0xFF;
+            let r = min(((buf_x - x) * 0xFF) / buf_x, ((buf_y - y) * 0xFF) / buf_y);
+            let g = min((x * 0xFF) / buf_x, ((buf_y - y) * 0xFF) / buf_y);
+            let b = min(((buf_x - x) * 0xFF) / buf_x, (y * 0xFF) / buf_y);
+            buf.write_all(&[b as u8, g as u8, r as u8, a as u8])
+                .unwrap();
+        }
+    }
+    buf.flush().unwrap();
+}
+
+/* 将来需要实现的功能:
+ * 1. 支持多显示器 - 为每个显示器创建独立的overlay
+ * 2. 动态光标 - 根据笔的状态(悬空、压力、倾斜等)做出变化
+ * 3. 支持不同的缩放比例
+ * 4. 与hud_interface模块集成，提供界面渲染接口
+ * 5. 支持多数位板，每个光标可以使用不同颜色标注
+ */
